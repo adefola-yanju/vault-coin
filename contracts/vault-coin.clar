@@ -190,3 +190,102 @@
     )
   )
 )
+
+;; CORE USER FUNCTIONS
+
+;; Create new collateralized debt position or expand existing position
+(define-public (create-position (btc-amount uint) (stable-amount uint))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (>= btc-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= stable-amount MINIMUM_LOAN_AMOUNT) ERR-MINIMUM-LOAN-REQUIRED)
+    
+    ;; Validate current BTC price availability
+    (let (
+      (btc-price (try! (get-current-price)))
+      (user tx-sender)
+      (existing-position (map-get? positions user))
+    )
+      (begin
+        ;; Apply global interest accrual
+        (accrue-global-interest)
+        
+        ;; Handle existing position interest or create new position baseline
+        (let (
+          (current-position 
+            (if (is-some existing-position)
+              (accrue-position-interest user)
+              {collateral: u0, debt: u0, last-update-block: stacks-block-height}
+            )
+          )
+        )
+        
+        ;; Calculate expanded position parameters
+        (let (
+          (old-collateral (get collateral current-position))
+          (old-debt (get debt current-position))
+          (new-collateral (+ old-collateral btc-amount))
+          (new-debt (+ old-debt stable-amount))
+          (min-required-collateral (required-collateral new-debt btc-price))
+        )
+          (begin
+            ;; Validate collateralization requirements
+            (asserts! (>= (collateral-value new-collateral btc-price) min-required-collateral) ERR-INSUFFICIENT-COLLATERAL)
+            
+            ;; Update user position
+            (map-set positions user {
+              collateral: new-collateral,
+              debt: new-debt,
+              last-update-block: stacks-block-height
+            })
+            
+            ;; Update global protocol metrics
+            (var-set total-collateral (+ (var-get total-collateral) btc-amount))
+            (var-set total-debt (+ (var-get total-debt) stable-amount))
+            
+            ;; Mint VaultCoins to user
+            (ft-mint? vault-coin stable-amount user)
+          )
+        ))
+      )
+    )
+  )
+)
+
+;; Add additional BTC collateral to existing position
+(define-public (add-collateral (btc-amount uint))
+  (let (
+    (user tx-sender)
+    (position (unwrap! (map-get? positions user) ERR-POSITION-NOT-FOUND))
+  )
+    (begin
+      (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+      (asserts! (> btc-amount u0) ERR-INVALID-AMOUNT)
+      
+      ;; Apply global interest accrual
+      (accrue-global-interest)
+      
+      ;; Update position with accumulated interest
+      (let (
+        (updated-position (accrue-position-interest user))
+        (new-debt (get debt updated-position))
+        (current-collateral (get collateral updated-position))
+        (new-collateral (+ current-collateral btc-amount))
+      )
+        (begin
+          ;; Update position with additional collateral
+          (map-set positions user {
+            collateral: new-collateral,
+            debt: new-debt,
+            last-update-block: stacks-block-height
+          })
+          
+          ;; Update global collateral tracking
+          (var-set total-collateral (+ (var-get total-collateral) btc-amount))
+          
+          (ok true)
+        )
+      )
+    )
+  )
+)
