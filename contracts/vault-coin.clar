@@ -386,3 +386,110 @@
     )
   )
 )
+
+;; LIQUIDATION SYSTEM
+
+;; Liquidate undercollateralized position to maintain protocol solvency
+(define-public (liquidate-position (user principal))
+  (begin
+    (asserts! (not (var-get protocol-paused)) ERR-PROTOCOL-PAUSED)
+    (let (
+      (position (unwrap! (map-get? positions user) ERR-POSITION-NOT-FOUND))
+      (liquidator tx-sender)
+    )
+      (begin
+        (asserts! (not (is-eq user liquidator)) ERR-NOT-AUTHORIZED)
+        
+        ;; Validate current BTC price availability
+        (let ((btc-price (try! (get-current-price))))
+          (begin
+            ;; Apply global interest accrual
+            (accrue-global-interest)
+            
+            ;; Update position with accumulated interest and assess liquidation eligibility
+            (let (
+              (updated-position (accrue-position-interest user))
+              (debt (get debt updated-position))
+              (collateral (get collateral updated-position))
+              (collateral-value-usd (collateral-value collateral btc-price))
+              (min-safety-value (/ (* debt LIQUIDATION-THRESHOLD) u100))
+            )
+              (begin
+                ;; Verify position is eligible for liquidation
+                (asserts! (< collateral-value-usd min-safety-value) ERR-NOT-AUTHORIZED)
+                
+                ;; Liquidator repays outstanding debt
+                (try! (ft-burn? vault-coin debt liquidator))
+                
+                ;; Calculate and distribute liquidation rewards
+                (let (
+                  (liquidation-bonus (/ (* collateral LIQUIDATION-PENALTY) u100))
+                  (liquidator-collateral (- collateral liquidation-bonus))
+                )
+                  (begin
+                    ;; Update global protocol metrics
+                    (var-set total-collateral (- (var-get total-collateral) collateral))
+                    (var-set total-debt (- (var-get total-debt) debt))
+                    
+                    ;; Remove liquidated position
+                    (map-delete positions user)
+                    
+                    ;; Accumulate liquidation penalty as protocol revenue
+                    (var-set stability-fee (+ (var-get stability-fee) liquidation-bonus))
+                    
+                    (ok true)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Retrieve user position details
+(define-read-only (get-position (user principal))
+  (map-get? positions user)
+)
+
+;; Calculate current collateralization ratio for user position
+(define-read-only (get-collateralization-ratio (user principal))
+  (match (map-get? positions user)
+    position (match (var-get btc-price-in-usd)
+      price-data (let (
+        (price (get price price-data))
+        (collateral (get collateral position))
+        (debt (get debt position))
+      )
+        (if (is-eq debt u0)
+          none
+          (some (/ (* (collateral-value collateral price) u100) debt))
+        ))
+      none)
+    none)
+)
+
+;; Retrieve comprehensive protocol statistics
+(define-read-only (get-protocol-stats)
+  {
+    total-debt: (var-get total-debt),
+    total-collateral: (var-get total-collateral),
+    stability-fee: (var-get stability-fee),
+    protocol-paused: (var-get protocol-paused),
+    btc-price: (var-get btc-price-in-usd)
+  }
+)
+
+;; INITIALIZATION
+
+;; Initialize protocol with deployer as initial owner
+(define-private (set-contract-owner)
+  (var-set protocol-owner tx-sender)
+)
+
+;; Execute initialization
+(set-contract-owner)
